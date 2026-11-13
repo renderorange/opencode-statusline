@@ -1,0 +1,1026 @@
+#!/usr/bin/perl
+
+# opencode-statusline: an OpenCode TUI statusline in the style of a shell prompt:
+#
+#   ~/git/repo (branch *) [model:Opus 5.5 | context:10% | cache:98% | cost:$1.97 | time:1h2m32s]
+#
+# tui.tsx runs this on each redraw and sends the session's details as JSON on STDIN.
+#
+# The layout comes from the file named by OPENCODE_STATUSLINE_CONFIG, or
+# $XDG_CONFIG_HOME/opencode-statusline/config.jsonc. Without one, the default below is
+# used. The file is JSONC: JSON::PP's relaxed mode accepts comments and trailing commas.
+# See README.md.
+
+use strict;
+use warnings;
+
+use Carp        ();
+use Encode      ();
+use English     qw(-no_match_vars);
+use JSON::PP    ();
+use List::Util  ();
+use POSIX       ();
+use Time::HiRes ();
+
+our $VERSION = '0.1.0';
+
+my @GIT_PROMPT_SCRIPTS = ( '/usr/lib/git-core/git-sh-prompt', '/usr/share/git-core/contrib/completion/git-prompt.sh', '/etc/bash_completion.d/git-prompt', '/opt/homebrew/etc/bash_completion.d/git-prompt.sh', '/usr/local/etc/bash_completion.d/git-prompt.sh', );
+
+# Seconds to wait for git before leaving the branch out
+my $GIT_TIMEOUT = 1;
+
+# Seconds a command from the config gets to finish, when it sets no timeout of its own
+my $COMMAND_TIMEOUT = 1;
+
+# Bytes of output to keep from git or a command; anything after this is read and thrown away
+my $OUTPUT_LIMIT = 4096;
+
+# Bytes read at a time when slurping stdin or the config file
+my $CHUNK_SIZE = 65_536;
+
+# The number shown by each section that shows one, for "at" in "colors". Percents are
+# rounded the same way they're shown, so a color starts at the percent you see.
+my %NUMBERS = (
+    context => sub { round_or_undef( number( dig( $_[0]{input}, qw(context_window used_percentage) ) ) ) },
+    cache   => sub { round_or_undef( cache_hit_rate( $_[0]{input} ) ) },
+    cost    => sub { number( dig( $_[0]{input}, qw(cost total_cost_usd) ) ) },
+);
+
+# Each section returns its text without the label, or nothing to leave it out
+my %SECTIONS = (
+    dir     => sub { short_dir( $_[0]{dir} ) },
+    git     => sub { git_prompt( $_[0]{dir}, $_[0]{config}{git} ) },
+    model   => sub { string( dig( $_[0]{input}, qw(model display_name) ) ) },
+    context => sub {
+        my $shown = percent( $NUMBERS{context}->( $_[0] ) );
+
+        if ( !defined $shown ) {
+            return;
+        }
+
+        if ( !flag( $_[0]{config}{context}{tokens} ) ) {
+            return $shown;
+        }
+
+        my $used  = number( dig( $_[0]{input}, qw(context_window used_tokens) ) );
+        my $limit = number( dig( $_[0]{input}, qw(context_window limit_tokens) ) );
+
+        if ( !defined $used ) {
+            return $shown;
+        }
+
+        my $counts = count($used);
+
+        if ( defined $limit ) {
+            $counts .= '/' . count($limit);
+        }
+
+        # The section's color wraps everything it returns, so close it before the
+        # counts; they take the muted color instead
+        return $shown . "\e[90m " . $counts . "\e[39m";
+    },
+    cache => sub { percent( $NUMBERS{cache}->( $_[0] ) ) },
+    cost  => sub { dollars( $NUMBERS{cost}->( $_[0] ) ) },
+    time  => sub { duration( number( dig( $_[0]{input}, qw(cost total_duration_ms) ) ) ) },
+);
+
+sub default_config {
+    return {
+        sections  => [ 'dir', 'git', { before => '[', sections => [qw(model context cache cost time)], separator => ' | ', after => ']' } ],
+        separator => ' ',
+        labels    => {
+            model   => 'model:',
+            context => 'context:',
+            cache   => 'cache:',
+            cost    => 'cost:',
+            time    => 'time:',
+        },
+        context  => { tokens => 0 },
+        muted    => [],
+        git      => { format => '(%s)', env => {} },
+        commands => {},
+        colors   => {},
+    };
+}
+
+binmode STDOUT, ':encoding(UTF-8)';
+
+my ( $input, $raw_input ) = read_input();
+my $dir = string( dig( $input, qw(workspace current_dir) ) ) // string( dig( $input, 'cwd' ) );
+
+my $settings;
+my $loaded = eval { $settings = load_config(); 1 };
+
+if ( !$loaded ) {
+    my $failure = defined $EVAL_ERROR ? $EVAL_ERROR : 'unknown error';
+
+    print 'opencode-statusline: ', scrub_error($failure), "\n";
+    exit;
+}
+
+my $line = render_items(
+    {   items     => $settings->{sections},
+        separator => $settings->{separator},
+        context   => { input => $input, raw_input => $raw_input, config => $settings, dir => $dir },
+    }
+);
+
+print $line // '', "\n";
+
+# Carp adds "at FILE line N." and a stack trace. The statusline is one line, so keep the
+# message and drop the trail.
+sub scrub_error {
+    my ($error) = @_;
+
+    if ( !defined $error ) {
+        return '';
+    }
+
+    $error =~ s/\n.*//s;
+    $error =~ s/\s+at\s+\S+\s+line\s+\d+.*$//;
+
+    return $error;
+}
+
+# Everything a handle can give, in pieces, so a huge config can't arrive as one string
+sub slurp {
+    my ($handle) = @_;
+
+    my $content = '';
+    my $chunk   = '';
+
+    while ( my $bytes = read( $handle, $chunk, $CHUNK_SIZE ) ) {
+        $content .= $chunk;
+    }
+
+    return $content;
+}
+
+# Reads all of stdin, then decodes it.
+sub read_input {
+    my $json = slurp( \*STDIN );
+
+    my $data;
+    my $decoded = eval { $data = JSON::PP->new->utf8->decode($json); 1 };
+
+    if ( !$decoded ) {
+        $data = undef;
+    }
+
+    my $parsed = {};
+
+    if ( ref $data eq 'HASH' ) {
+        $parsed = $data;
+    }
+
+    # The parsed input, and the bytes as sent, which are passed on to commands
+    return ( $parsed, $json );
+}
+
+sub config_path {
+    if ( length( $ENV{OPENCODE_STATUSLINE_CONFIG} // '' ) ) {
+        return Encode::decode( 'UTF-8', $ENV{OPENCODE_STATUSLINE_CONFIG} );
+    }
+
+    my $base = length( $ENV{XDG_CONFIG_HOME} // '' ) ? $ENV{XDG_CONFIG_HOME} : ( $ENV{HOME} // '' ) . '/.config';
+
+    return Encode::decode( 'UTF-8', "$base/opencode-statusline/config.jsonc" );
+}
+
+# Reads the config file over the defaults, dying with a message for the statusline if it's wrong
+sub load_config {
+    my $config = default_config();
+    my $path   = config_path();
+    my $name   = short_dir($path);
+
+    my $path_bytes = Encode::encode( 'UTF-8', $path );
+
+    if ( !-e $path_bytes ) {
+        return $config;
+    }
+
+    my $fh;
+
+    if ( !open( $fh, '<:raw', $path_bytes ) ) {
+        Carp::confess("$name: can't read it");
+    }
+
+    my $json = slurp($fh);
+
+    if ( !close($fh) ) {
+        Carp::confess("$name: can't close it");
+    }
+
+    my $user;
+    my $parse_error = '';
+
+    my $decoded = eval {
+        my $decoder = JSON::PP->new->utf8->relaxed;
+        $user = $decoder->decode($json);
+        1;
+    };
+
+    if ( !$decoded ) {
+        $parse_error = defined $EVAL_ERROR ? "$EVAL_ERROR" : '';
+    }
+
+    if ( !defined $user ) {
+        $parse_error =~ s/,? at \S+ line \d+\.?\s*$//;
+
+        Carp::confess("$name: not valid JSON: $parse_error");
+    }
+
+    if ( ref $user ne 'HASH' ) {
+        Carp::confess("$name: should hold a JSON object, like {\"separator\": \" \"}");
+    }
+
+    for my $key ( sort keys %{$user} ) {
+        if ( !exists $config->{$key} ) {
+            Carp::confess("$name: unknown setting \"$key\"");
+        }
+
+        if ( ref $config->{$key} eq 'HASH' && ref $user->{$key} eq 'HASH' ) {
+            $config->{$key} = { %{ $config->{$key} }, %{ $user->{$key} } };
+        }
+        else {
+            $config->{$key} = $user->{$key};
+        }
+    }
+
+    my $error = check_config($config);
+
+    if ($error) {
+        Carp::confess("$name: $error");
+    }
+
+    return $config;
+}
+
+# Returns a description of the first problem found, or nothing if the config is usable
+sub check_config {
+    my ($config) = @_;
+
+    my $error = check_commands( $config->{commands} );
+
+    if ($error) {
+        return $error;
+    }
+
+    $error = check_context( $config->{context} );
+
+    if ($error) {
+        return $error;
+    }
+
+    $error = check_muted($config);
+
+    if ($error) {
+        return $error;
+    }
+
+    $error = check_sections( $config->{sections}, 'sections', $config );
+
+    if ($error) {
+        return $error;
+    }
+
+    if ( !is_text( $config->{separator} ) ) {
+        return '"separator" should be text';
+    }
+
+    if ( ref $config->{labels} ne 'HASH' ) {
+        return '"labels" should be an object, like {"model": "model:"}';
+    }
+
+    for my $section ( sort keys %{ $config->{labels} } ) {
+        if ( !is_section( $config, $section ) ) {
+            return "unknown section \"$section\" in \"labels\"";
+        }
+
+        if ( !is_text( $config->{labels}{$section} ) ) {
+            return "label for \"$section\" should be text";
+        }
+    }
+
+    $error = check_colors($config);
+
+    if ($error) {
+        return $error;
+    }
+
+    my $git = $config->{git};
+
+    if ( ref $git ne 'HASH' ) {
+        return '"git" should be an object, like {"format": "(%s)"}';
+    }
+
+    for my $key ( sort keys %{$git} ) {
+        if ( $key !~ /^(?:format|script|env)$/ ) {
+            return "unknown setting \"$key\" in \"git\"";
+        }
+    }
+
+    if ( !is_text( $git->{format} ) ) {
+        return '"git.format" should be text';
+    }
+
+    if ( exists $git->{script} && !is_text( $git->{script} ) ) {
+        return '"git.script" should be text';
+    }
+
+    if ( ref $git->{env} ne 'HASH' ) {
+        return '"git.env" should be an object, like {"GIT_PS1_SHOWDIRTYSTATE": "1"}';
+    }
+
+    for my $variable ( sort keys %{ $git->{env} } ) {
+        if ( !is_text( $git->{env}{$variable} ) ) {
+            return "\"git.env\" value for \"$variable\" should be text";
+        }
+    }
+
+    return;
+}
+
+sub check_commands {
+    my ($commands) = @_;
+
+    if ( ref $commands ne 'HASH' ) {
+        return '"commands" should be an object, like {"k8s": {"run": "kubectl config current-context"}}';
+    }
+
+    for my $name ( sort keys %{$commands} ) {
+        if ( !length $name ) {
+            return 'a command in "commands" has an empty name';
+        }
+
+        if ( $SECTIONS{$name} ) {
+            return "command \"$name\" has the same name as a built-in section";
+        }
+
+        my $command = $commands->{$name};
+
+        if ( ref $command ne 'HASH' ) {
+            return "command \"$name\" should be an object, like {\"run\": \"date +%H:%M\"}";
+        }
+
+        for my $key ( sort keys %{$command} ) {
+            if ( $key !~ /^(?:run|timeout)$/ ) {
+                return "unknown setting \"$key\" in command \"$name\"";
+            }
+        }
+
+        if ( !is_text( $command->{run} ) || !length $command->{run} ) {
+            return "command \"$name\" needs \"run\", the command to run, like \"date +%H:%M\"";
+        }
+
+        my $timeout = number( $command->{timeout} );
+
+        if ( exists $command->{timeout} && !( defined $timeout && $timeout > 0 ) ) {
+            return "\"timeout\" in command \"$name\" should be a number of seconds above 0, like 1";
+        }
+    }
+
+    return;
+}
+
+# The "context" block.  "tokens" adds the used and limit token counts after the
+# percent, as 163k/1M.  Only the percent drives the color thresholds.
+sub check_context {
+    my ($context) = @_;
+
+    if ( ref $context ne 'HASH' ) {
+        return '"context" should be an object, like {"tokens": 1}';
+    }
+
+    for my $key ( sort keys %{$context} ) {
+        if ( $key ne 'tokens' ) {
+            return "unknown setting \"$key\" in \"context\"";
+        }
+    }
+
+    if ( !is_flag( $context->{tokens} ) ) {
+        return '"tokens" in "context" should be 1 or 0';
+    }
+
+    return;
+}
+
+# The "muted" list: sections drawn in the muted (grey) color
+sub check_muted {
+    my ($config) = @_;
+
+    my $muted = $config->{muted};
+
+    if ( ref $muted ne 'ARRAY' ) {
+        return '"muted" should be a list of section names, like ["time"]';
+    }
+
+    for my $name ( @{$muted} ) {
+        if ( !is_text($name) ) {
+            return 'each name in "muted" should be text';
+        }
+
+        if ( !is_section( $config, $name ) ) {
+            return "unknown section \"$name\" in \"muted\" (known: " . join( ', ', sort( keys %SECTIONS, keys %{ $config->{commands} } ) ) . ')';
+        }
+    }
+
+    return;
+}
+
+# A flag in the config: 1, 0, true or false
+sub is_flag {
+    my ($value) = @_;
+
+    if ( !defined $value ) {
+        return 0;
+    }
+
+    if ( ref $value eq 'JSON::PP::Boolean' ) {
+        return 1;
+    }
+
+    return !ref $value && $value =~ /^(?:0|1)$/ ? 1 : 0;
+}
+
+# True or false, accepting JSON's true/false as well as 1 and 0
+sub flag {
+    my ($value) = @_;
+
+    if ( !defined $value ) {
+        return 0;
+    }
+
+    # JSON::PP::Boolean overloads boolean context, so this covers true/false too
+    return $value ? 1 : 0;
+}
+
+sub check_colors {
+    my ($config) = @_;
+
+    my $colors = $config->{colors};
+
+    if ( ref $colors ne 'HASH' ) {
+        return '"colors" should be an object, like {"context": {"color": "#ff69b4", "at": 45}}';
+    }
+
+    for my $name ( sort keys %{$colors} ) {
+        if ( !is_section( $config, $name ) ) {
+            return "unknown section \"$name\" in \"colors\"";
+        }
+
+        my $value = $colors->{$name};
+
+        if ( ref $value ne 'ARRAY' ) {
+            my $error = check_color( $value, $name, "\"$name\"" );
+
+            if ($error) {
+                return $error;
+            }
+
+            next;
+        }
+
+        if ( !@{$value} ) {
+            return "the list of colors for \"$name\" is empty";
+        }
+
+        my %seen_at;
+        my $without_at = 0;
+
+        for my $index ( 0 .. $#{$value} ) {
+            my $color = $value->[$index];
+            my $error = check_color( $color, $name, "\"$name\" (color " . ( $index + 1 ) . ')' );
+
+            if ($error) {
+                return $error;
+            }
+
+            if ( !exists $color->{at} ) {
+                if ( $without_at++ ) {
+                    return "only one color for \"$name\" can leave out \"at\"";
+                }
+            }
+            elsif ( $seen_at{ 0 + $color->{at} }++ ) {
+                return "two colors for \"$name\" have the same \"at\", $color->{at}";
+            }
+        }
+    }
+
+    return;
+}
+
+# Checks one color for a section; $where names it in messages
+sub check_color {
+    my ( $color, $name, $where ) = @_;
+
+    if ( ref $color ne 'HASH' ) {
+        return "color for $where should be an object, like {\"color\": \"#ff69b4\"}, or a list of them";
+    }
+
+    for my $key ( sort keys %{$color} ) {
+        if ( $key !~ /^(?:color|at)$/ ) {
+            return "unknown setting \"$key\" in color for $where";
+        }
+    }
+
+    if ( !exists $color->{color} ) {
+        return "color for $where needs \"color\", a color like \"#ff69b4\"";
+    }
+
+    if ( !is_text( $color->{color} ) || $color->{color} !~ /^#[0-9a-fA-F]{6}$/ ) {
+        return "\"color\" for $where should be a color like \"#ff69b4\"";
+    }
+
+    if ( !exists $color->{at} ) {
+        return;
+    }
+
+    if ( !defined number( $color->{at} ) ) {
+        return "\"at\" for $where should be a number, like 45";
+    }
+
+    if ( !$NUMBERS{$name} ) {
+        return "\"at\" for $where can't be used, because \"$name\" doesn't show a number " . '("at" works for: ' . join( ', ', sort keys %NUMBERS ) . ')';
+    }
+
+    return;
+}
+
+sub check_sections {
+    my ( $sections, $where, $config ) = @_;
+
+    if ( ref $sections ne 'ARRAY' ) {
+        return "\"$where\" should be a list, like [\"dir\", \"git\"]";
+    }
+
+    for my $item ( @{$sections} ) {
+        if ( ref $item eq 'HASH' ) {
+            my $error = check_group( $item, $where, $config );
+
+            if ($error) {
+                return $error;
+            }
+        }
+        elsif ( is_text($item) ) {
+            if ( !is_section( $config, $item ) ) {
+                return "unknown section \"$item\" in \"$where\" (known: " . join( ', ', sort( keys %SECTIONS, keys %{ $config->{commands} } ) ) . ')';
+            }
+        }
+        else {
+            return "each item in \"$where\" should be a section name or a group";
+        }
+    }
+
+    return;
+}
+
+# One group in "sections": its own keys, then its own sections
+sub check_group {
+    my ( $item, $where, $config ) = @_;
+
+    for my $key ( sort keys %{$item} ) {
+        if ( $key !~ /^(?:sections|separator|before|after|muted_separator)$/ ) {
+            return "unknown setting \"$key\" in a group in \"$where\"";
+        }
+    }
+
+    for my $key (qw(separator before after)) {
+        if ( exists $item->{$key} && !is_text( $item->{$key} ) ) {
+            return "\"$key\" in a group in \"$where\" should be text";
+        }
+    }
+
+    if ( exists $item->{muted_separator} && !is_flag( $item->{muted_separator} ) ) {
+        return "\"muted_separator\" in a group in \"$where\" should be 1 or 0";
+    }
+
+    return check_sections( $item->{sections}, "$where.sections", $config );
+}
+
+# True for a built-in section or a command from the config
+sub is_section {
+    my ( $config, $name ) = @_;
+
+    return $SECTIONS{$name} || $config->{commands}{$name};
+}
+
+sub is_text {
+    my ($value) = @_;
+
+    return defined $value && !ref $value;
+}
+
+# Joins the items that have something to show, or returns nothing if none do
+sub render_items {
+    my ($args) = @_;
+
+    my @parts = grep {defined} map { render_item( { item => $_, context => $args->{context} } ) } @{ $args->{items} };
+
+    if ( !@parts ) {
+        return;
+    }
+
+    return join( $args->{separator}, @parts );
+}
+
+sub render_item {
+    my ($args) = @_;
+
+    my $item    = $args->{item};
+    my $context = $args->{context};
+
+    if ( ref $item eq 'HASH' ) {
+        my $separator = $item->{separator} // ' ';
+
+        if ( flag( $item->{muted_separator} ) ) {
+            $separator = muted($separator);
+        }
+
+        my $inner = render_items( { items => $item->{sections}, separator => $separator, context => $context } );
+
+        if ( !defined $inner ) {
+            return;
+        }
+
+        return ( $item->{before} // '' ) . $inner . ( $item->{after} // '' );
+    }
+
+    my $value;
+
+    if ( $SECTIONS{$item} ) {
+        $value = $SECTIONS{$item}->($context);
+    }
+    else {
+        $value = run_command( $context->{config}{commands}{$item}, $context );
+    }
+
+    if ( !defined $value || !length $value ) {
+        return;
+    }
+
+    my $text = ( $context->{config}{labels}{$item} // '' ) . $value;
+
+    if ( is_muted( $context->{config}, $item ) ) {
+        return muted($text);
+    }
+
+    return colored( $item, $text, $context );
+}
+
+# True for a section the config lists under "muted"
+sub is_muted {
+    my ( $config, $name ) = @_;
+
+    my $muted = $config->{muted};
+
+    if ( ref $muted ne 'ARRAY' ) {
+        return 0;
+    }
+
+    return scalar grep { defined && $_ eq $name } @{$muted};
+}
+
+# A section drawn in the muted color.  90 is the terminal's bright black, which the
+# OpenCode plugin maps to its own muted text color.
+sub muted {
+    my ($text) = @_;
+
+    return "\e[90m$text\e[39m";
+}
+
+# Wraps a section's text, label included, in its color from the config. A color with "at" only
+# counts when the number the section shows is at or above it. From a list, the color with the
+# highest "at" that's been reached wins, then the one without "at", if there is one.
+sub colored {
+    my ( $name, $text, $context ) = @_;
+
+    my $colors = $context->{config}{colors}{$name};
+
+    if ( !$colors ) {
+        return $text;
+    }
+
+    my $shown;
+
+    if ( $NUMBERS{$name} ) {
+        $shown = $NUMBERS{$name}->($context);
+    }
+
+    my @choices = ref $colors eq 'ARRAY' ? @{$colors} : ($colors);
+    my @reached = grep { !exists $_->{at} || ( defined $shown && $shown >= $_->{at} ) } @choices;
+
+    # A color without "at" sorts below every number
+    my $lowest = -9**9**9;
+    my ($color) = sort { ( $b->{at} // $lowest ) <=> ( $a->{at} // $lowest ) } @reached;
+
+    if ( !$color ) {
+        return $text;
+    }
+
+    # A 24-bit foreground color, then back to the terminal's own foreground color
+    my ( $red, $green, $blue ) = map {hex} $color->{color} =~ /^#(..)(..)(..)$/;
+
+    return sprintf( "\e[38;2;%d;%d;%dm%s\e[39m", $red, $green, $blue, $text );
+}
+
+# Walks nested hashes, returning undef if any step is missing or not a hash
+sub dig {
+    my ( $data, @path ) = @_;
+
+    for my $key (@path) {
+        if ( ref $data ne 'HASH' ) {
+            return;
+        }
+
+        $data = $data->{$key};
+    }
+
+    return $data;
+}
+
+sub string {
+    my ($value) = @_;
+
+    return defined $value && !ref $value && length $value ? $value : undef;
+}
+
+sub number {
+    my ($value) = @_;
+
+    if ( !defined $value || ref $value ) {
+        return;
+    }
+
+    return $value =~ /^-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/ ? $value : undef;
+}
+
+# Rounds half up, so 12.5 becomes 13
+sub round {
+    my ($value) = @_;
+
+    return POSIX::floor( $value + 0.5 );
+}
+
+sub round_or_undef {
+    my ($value) = @_;
+
+    return defined $value ? round($value) : undef;
+}
+
+sub percent {
+    my ($value) = @_;
+
+    return defined $value ? round($value) . '%' : undef;
+}
+
+sub dollars {
+    my ($value) = @_;
+
+    return defined $value ? sprintf( '$%.2f', $value ) : undef;
+}
+
+# Token counts the way people read them: 963, 16k, 1M
+sub count {
+    my ($value) = @_;
+
+    if ( !defined $value ) {
+        return;
+    }
+
+    # Rounding to the display unit can carry, so the changeover sits half a unit early:
+    # 999,999 tokens reads 1M, never 1000k
+    if ( $value >= 999_500 ) {
+        my $millions = sprintf '%.1f', $value / 1_000_000;
+        $millions =~ s/\.0$//;
+
+        return $millions . 'M';
+    }
+
+    if ( $value >= 1000 ) {
+        return round( $value / 1000 ) . 'k';
+    }
+
+    return int($value) . '';
+}
+
+sub short_dir {
+    my ($directory) = @_;
+
+    if ( !defined $directory ) {
+        return;
+    }
+
+    my $home = Encode::decode( 'UTF-8', $ENV{HOME} // '' );
+    $home =~ s{/+$}{};
+
+    if ( $home eq '' ) {
+        return $directory;
+    }
+
+    if ( $directory eq $home ) {
+        return '~';
+    }
+
+    if ( index( $directory, "$home/" ) == 0 ) {
+        return '~' . substr( $directory, length $home );
+    }
+
+    return $directory;
+}
+
+sub git_prompt {
+    my ( $directory, $git ) = @_;
+
+    if ( !defined $directory || !-d Encode::encode( 'UTF-8', $directory ) ) {
+        return;
+    }
+
+    my $script = $git->{script} // List::Util::first {-r} @GIT_PROMPT_SCRIPTS;
+
+    if ( !defined $script || !-r $script ) {
+        return;
+    }
+
+    local $ENV{GIT_PS1_SHOWDIRTYSTATE} = $ENV{GIT_PS1_SHOWDIRTYSTATE} // 1;
+    local @ENV{ keys %{ $git->{env} } } = map { Encode::encode( 'UTF-8', $_ ) } values %{ $git->{env} };
+
+    # Don't take git's index lock just to draw the prompt
+    local $ENV{GIT_OPTIONAL_LOCKS} = $ENV{GIT_OPTIONAL_LOCKS} // 0;
+
+    my ($out) = run_program(
+        {   command => [ 'bash', '-c', '. "$1" && __git_ps1 "$2"', 'opencode-statusline', $script, Encode::encode( 'UTF-8', $git->{format} ), ],
+            input   => '',
+            dir     => $directory,
+            timeout => $GIT_TIMEOUT,
+        }
+    );
+
+    if ( !defined $out ) {
+        return;
+    }
+
+    $out = Encode::decode( 'UTF-8', $out );
+    $out =~ s/^\s+|\s+$//g;
+
+    return length $out ? $out : undef;
+}
+
+# Runs a command from the config with the session's JSON on STDIN, returning the first
+# line it prints, or nothing if it prints nothing, fails, or runs past its time limit
+sub run_command {
+    my ( $command, $context ) = @_;
+
+    my ( $output, $status ) = run_program(
+        {   command => [ '/bin/sh', '-c', Encode::encode( 'UTF-8', $command->{run} ) ],
+            input   => $context->{raw_input},
+            dir     => $context->{dir},
+            timeout => $command->{timeout} // $COMMAND_TIMEOUT,
+        }
+    );
+
+    if ( !defined $output || $status != 0 ) {
+        return;
+    }
+
+    my ($first) = split /\n/, $output;
+
+    if ( !defined $first ) {
+        return;
+    }
+
+    $first = Encode::decode( 'UTF-8', $first );
+    $first =~ s/^\s+|\s+$//g;
+
+    return length $first ? $first : undef;
+}
+
+# Runs a program with input on STDIN, from dir when that's a folder, returning the start of
+# what it prints (up to $OUTPUT_LIMIT bytes) and its exit status. Returns nothing if it's still
+# running after the timeout, and stops it along with everything it started.
+sub run_program {
+    my ($args) = @_;
+
+    my $command = $args->{command};
+    my $payload = $args->{input} // '';
+    my $where   = $args->{dir};
+    my $timeout = $args->{timeout} // $COMMAND_TIMEOUT;
+
+    pipe( my $stdin_read,  my $stdin_write )  or return;
+    pipe( my $stdout_read, my $stdout_write ) or return;
+
+    my $pid = fork // return;
+
+    if ( $pid == 0 ) {
+
+        # Its own process group, so a timeout can stop everything the program started
+        setpgrp( 0, 0 );
+
+        open( \*STDIN,  '<&', $stdin_read )   or POSIX::_exit(1);
+        open( \*STDOUT, '>&', $stdout_write ) or POSIX::_exit(1);
+        open( \*STDERR, '>',  '/dev/null' )   or POSIX::_exit(1);
+
+        for my $handle ( $stdin_read, $stdin_write, $stdout_read, $stdout_write ) {
+            close($handle) or POSIX::_exit(1);
+        }
+
+        # Run from the session's folder when there is one, otherwise from wherever this was started
+        if ( defined $where ) {
+            chdir Encode::encode( 'UTF-8', $where );
+        }
+
+        { exec { $command->[0] } @{$command} };
+        POSIX::_exit(127);
+    }
+
+    # Set in the parent as well, so the group exists before any timeout tries to stop it
+    setpgrp( $pid, $pid );
+    close($stdin_read)   or return;
+    close($stdout_write) or return;
+
+    # A program that exits without reading its input shouldn't take this script down with it
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $output = '';
+    my $status;
+
+    my $completed = eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        Time::HiRes::alarm($timeout);
+
+        print {$stdin_write} $payload;
+        close($stdin_write) or die "close failed\n";
+
+        # Read in pieces, keeping only the start, so a program that prints without stopping
+        # can't fill memory and the time limit gets checked between pieces. Reading to the
+        # end, rather than stopping early, lets the program finish normally.
+        while ( sysread $stdout_read, my $piece, $CHUNK_SIZE ) {
+            if ( length $output < $OUTPUT_LIMIT ) {
+                $output .= $piece;
+            }
+        }
+
+        close($stdout_read) or die "close failed\n";
+
+        waitpid $pid, 0;
+
+        # $? is the only spelling of the wait status; English's alias is unavailable here
+        $status = $?;
+        1;
+    };
+    Time::HiRes::alarm(0);
+
+    if ( !$completed || !defined $status ) {
+        kill 'KILL', -$pid;
+        waitpid $pid, 0;
+
+        return;
+    }
+
+    return ( substr( $output, 0, $OUTPUT_LIMIT ), $status );
+}
+
+# Uses the hit ratio from the JSON when the client sends one,
+# otherwise works it out from the last request's token counts
+sub cache_hit_rate {
+    my ($session) = @_;
+
+    my $ratio = number( dig( $session, qw(prompt_cache hit_ratio) ) );
+
+    if ( defined $ratio ) {
+        return $ratio * 100;
+    }
+
+    my $usage = dig( $session, qw(context_window current_usage) );
+    my ( $read, $created, $uncached ) = map { number( dig( $usage, $_ ) ) // 0 } qw(cache_read_input_tokens cache_creation_input_tokens input_tokens);
+
+    my $total = $read + $created + $uncached;
+
+    if ( !( $total > 0 ) ) {
+        return;
+    }
+
+    return $read / $total * 100;
+}
+
+sub duration {
+    my ($ms) = @_;
+
+    if ( !defined $ms ) {
+        return;
+    }
+
+    my $seconds = int( $ms / 1000 ) % 60;
+    my $minutes = int( $ms / 60_000 ) % 60;
+    my $hours   = int( $ms / 3_600_000 );
+
+    if ($hours) {
+        return $hours . 'h' . $minutes . 'm' . $seconds . 's';
+    }
+
+    if ($minutes) {
+        return $minutes . 'm' . $seconds . 's';
+    }
+
+    return $seconds . 's';
+}

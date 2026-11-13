@@ -1,0 +1,88 @@
+/*
+  An example layout for opencode-statusline.  Copy it to
+  $XDG_CONFIG_HOME/opencode-statusline/config.jsonc — usually
+  ~/.config/opencode-statusline/config.jsonc — or to the file named by
+  OPENCODE_STATUSLINE_CONFIG, and edit the copy.  Without a config file the formatter
+  draws its built-in default: dir, git, then model/context/cache/cost/time in brackets.
+
+  Draws:
+
+    ~/git/project (main) 12% 120k/1M - 4m32s
+
+  Comments: this is JSONC.  The formatter decodes with JSON::PP's "relaxed" mode, which
+  accepts block comments, line comments, and a trailing comma before a closing bracket.
+
+  "thinking" is a command of our own that reads the model variant out of the JSON the
+  plugin sends on STDIN.
+
+  "model" and "thinking" are deliberately not in "sections": the TUI already shows the
+  model and its variant in the composer, so drawing them here duplicates them.  Add them
+  back to the group below to put them on this line instead; the provider rides along
+  inside the model section ("DeepSeek V4.1 Flash (Alibaba Token Plan)").
+*/
+{
+    "sections": [
+        "dir",
+        "git",
+        {
+            "sections": ["context", "time"],
+            "separator": " - ",
+
+            /* The dash is part of the dimmed tail, not the strong part */
+            "muted_separator": 1
+        }
+    ],
+
+    /* Between the top-level items: the folder, the branch, then the group */
+    "separator": " ",
+
+    /* The layout above has no labels; the separators carry the structure */
+    "labels": {
+        "dir": "",
+        "git": "",
+        "model": "",
+        "thinking": "",
+        "context": "",
+        "time": ""
+    },
+
+    "git": {
+        /* %s is the branch and its status, from git's own __git_ps1 */
+        "format": "(%s)",
+        "env": {
+            "GIT_PS1_SHOWDIRTYSTATE": "1",
+            "GIT_PS1_SHOWUNTRACKEDFILES": "1"
+        }
+    },
+
+    "commands": {
+        /*
+          The model variant, e.g. "high".  Prints nothing at the model default, so the
+          section and its separator drop out.
+        */
+        "thinking": {
+            "run": "perl -MJSON::PP -0777 -ne '$t = eval { decode_json($_)->{thinking} }; print defined $t ? $t : \"\"'",
+            "timeout": 2
+        }
+    },
+
+    /* Add the token counts after the percent: 16% 163k/1M */
+    "context": { "tokens": 1 },
+
+    /* Sections drawn in the muted color: the time, so only the percent stands out */
+    "muted": ["time"],
+
+    /*
+      A fire getting hotter, scaled for a 1,000,000-token window (the upstream
+      45/60/75/90 example assumes ~200k).  Below 20% the percent keeps the terminal's
+      own color.
+    */
+    "colors": {
+        "context": [
+            { "color": "#ff3030", "at": 20 },
+            { "color": "#ff8700", "at": 35 },
+            { "color": "#ff69b4", "at": 50 },
+            { "color": "#af5fff", "at": 70 }
+        ]
+    }
+}

@@ -1,0 +1,52 @@
+{
+  "name": "@renderorange/opencode-statusline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode TUI statusline in the style of a shell prompt",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "tui",
+    "plugin",
+    "statusline"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/renderorange/opencode-statusline.git"
+  },
+  "bugs": {
+    "url": "https://github.com/renderorange/opencode-statusline/issues"
+  },
+  "exports": {
+    "./tui": "./tui.tsx"
+  },
+  "files": [
+    "bin/",
+    "tui.tsx",
+    "statusline.example.jsonc",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "lint": "perlcritic bin/opencode-statusline",
+    "tidy:check": "perltidy -st bin/opencode-statusline | diff -u bin/opencode-statusline -",
+    "test": "prove -r t"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "*",
+    "@opentui/core": ">=0.6.6",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "@opentui/core": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  }
+}

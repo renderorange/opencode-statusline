@@ -30,6 +30,7 @@
  */
 import { createSignal } from "solid-js"
 import { Plugin } from "@opencode/plugin/tui"
+import { statSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -99,6 +100,24 @@ function toSpans(line: string): Span[] {
   return spans
 }
 
+/**
+ * A working directory that exists, or undefined to inherit the process's own.
+ *
+ * `spawn` rejects with ENOENT naming the *command* when `cwd` is missing, which reads as
+ * "the formatter is gone". That is what a renamed or deleted session directory produces,
+ * and taking the whole bar down for it is wrong: the formatter resolves git from the JSON
+ * it is handed, so inheriting is a fine fallback.
+ */
+function spawnCwd(dir: string): string | undefined {
+  try {
+    if (statSync(dir).isDirectory()) return dir
+  } catch {
+    /* the directory is gone; fall through to inheriting */
+  }
+
+  return undefined
+}
+
 /** Sums the tokens an assistant message accounted for, which is what fills the window. */
 function contextOf(message: any): { used: number; read: number; write: number; input: number } | undefined {
   const tokens = message?.tokens
@@ -135,7 +154,7 @@ export default Plugin.define({
         let settled = false
 
         const child = spawn(command, args, {
-          cwd: options.cwd ?? location.directory,
+          cwd: spawnCwd(options.cwd ?? location.directory),
           env: { ...process.env, ...options.env },
           stdio: ["pipe", "pipe", "ignore"],
         })
@@ -465,15 +484,15 @@ export default Plugin.define({
       const pending = behind()
 
       return (
-        <box flexDirection="row" gap={0}>
+        <box flexDirection="row" flexWrap="no-wrap" height={1} overflow="hidden" gap={0}>
           {line().length === 0 ? (
-            <text fg={mutedFg()}>statusline: waiting for session</text>
+            <text wrapMode="none" fg={mutedFg()}>statusline: waiting for session</text>
           ) : (
             line().map((span) => (
-              <text fg={span.muted ? mutedFg() : (span.color ?? baseFg())}>{span.text}</text>
+              <text wrapMode="none" fg={span.muted ? mutedFg() : (span.color ?? baseFg())}>{span.text}</text>
             ))
           )}
-          {pending > 0 ? <text fg={warningFg()}>{` \u2191${pending}`}</text> : null}
+          {pending > 0 ? <text wrapMode="none" fg={warningFg()}>{` \u2191${pending}`}</text> : null}
         </box>
       )
     }

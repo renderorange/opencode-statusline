@@ -9,11 +9,16 @@
 
     ~/git/project (main) 12% 120k/1M - 4m32s
 
-  Comments: this is JSONC.  The formatter decodes with JSON::PP's "relaxed" mode, which
-  accepts block comments, line comments, and a trailing comma before a closing bracket.
+  When the installed knowledge-mcp is behind, the line gains a tail:
+
+    ~/git/project (main) 12% 120k/1M - 4m32s (kmcp v1.7.0->v1.7.1)
 
   "thinking" is a command of our own that reads the model variant out of the JSON the
-  plugin sends on STDIN.
+  plugin sends on STDIN.  "kmcp" is another command (see below); it prints nothing
+  while knowledge-mcp is current, so the tail stays off by default.
+
+  Comments: this is JSONC.  The formatter decodes with JSON::PP's "relaxed" mode, which
+  accepts block comments, line comments, and a trailing comma before a closing bracket.
 
   "model" and "thinking" are deliberately not in "sections": the TUI already shows the
   model and its variant in the composer, so drawing them here duplicates them.  Add them
@@ -30,6 +35,13 @@
 
             /* The dash is part of the dimmed tail, not the strong part */
             "muted_separator": 1
+        },
+        {
+            /* (kmcp v1.7.0->v1.7.1) when the installed knowledge-mcp is behind.
+               Prints nothing when current, so the group drops out entirely. */
+            "sections": ["kmcp"],
+            "before": "(",
+            "after": ")"
         }
     ],
 
@@ -43,7 +55,8 @@
         "model": "",
         "thinking": "",
         "context": "",
-        "time": ""
+        "time": "",
+        "kmcp": "kmcp "
     },
 
     "git": {
@@ -63,6 +76,20 @@
         "thinking": {
             "run": "perl -MJSON::PP -0777 -ne '$t = eval { decode_json($_)->{thinking} }; print defined $t ? $t : \"\"'",
             "timeout": 2
+        },
+
+        /*
+          The installed knowledge-mcp announcing itself when it is behind: one line
+          (v1.7.0->v1.7.1) when a newer release exists, nothing at all when current,
+          so the tail group drops out.  Needs knowledge-mcp's --brief --check-updates
+          (renderorange/knowledge-mcp#45); until then the command prints nothing and
+          the line is unchanged.  5s gives the check (knowledge-mcp's own network
+          timeout is 3s) room to finish, and the formatter kills the process group
+          on timeout, so a wedged binary cannot hold the bar.
+        */
+        "kmcp": {
+            "run": "knowledge-mcp debug --brief --check-updates",
+            "timeout": 5
         }
     },
 

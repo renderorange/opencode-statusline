@@ -28,9 +28,10 @@ my $MUTED = "\e[90m";
 my $PLAIN = "\e[39m";
 
 # Feeds JSON to the formatter and returns everything it prints.  HOME and the config path
-# are pinned so the output does not depend on the machine running the tests.
+# are pinned so the output does not depend on the machine running the tests.  $extra_env
+# is a hash of extra environment variables for this run, e.g. a stub directory on PATH.
 sub run_formatter {
-    my ( $input, $config ) = @_;
+    my ( $input, $config, $extra_env ) = @_;
 
     my $path = File::Spec->catfile( $CONFIG_DIR, 'config.jsonc' );
 
@@ -48,6 +49,7 @@ sub run_formatter {
         HOME                       => $HOME,
         XDG_CONFIG_HOME            => $CONFIG_DIR,
         OPENCODE_STATUSLINE_CONFIG => $path,
+        %{ $extra_env // {} },
     );
 
     my ( $reader, $writer );
@@ -63,6 +65,22 @@ sub run_formatter {
     waitpid( $pid, 0 );
 
     return defined $output ? $output : '';
+}
+
+# A fake "knowledge-mcp" on PATH, so the kmcp recipe needs neither the real binary nor
+# the network.  $text is what the script prints.
+sub stub_kmcp {
+    my ($text) = @_;
+
+    my $dir = File::Temp::tempdir( CLEANUP => 1 );
+    my $bin = File::Spec->catfile( $dir, 'knowledge-mcp' );
+
+    open( my $handle, '>:encoding(UTF-8)', $bin ) or die "can't write stub: $!";
+    print {$handle} "#!/bin/sh\n", length($text) ? "printf '%s\n' '$text'\n" : '', "exit 0\n";
+    close($handle) or die "can't close stub: $!";
+    chmod 0755, $bin or die "can't chmod stub: $!";
+
+    return $dir;
 }
 
 # JSON is built rather than pasted, so a stray quote cannot quietly change a test
@@ -296,6 +314,50 @@ is(
     ),
     "a\\b\n",
     'a backslash in a command survives to its output'
+);
+
+# The kmcp recipe, as documented: a group with parens and the "kmcp " label, driven by the
+# exact command from the example config.  A command that prints nothing drops the whole
+# group out, parens and separator included.
+my $KMCP_RUN = 'knowledge-mcp debug --brief --check-updates';
+
+sub kmcp_config {
+    return test_config(
+        {   sections => [ 'dir', 'git', { sections => ['kmcp'], before => '(', after => ')' } ],
+            labels   => { dir => '', git => '', kmcp => 'kmcp ' },
+            commands => { kmcp => { run => $KMCP_RUN, timeout => 5 } },
+        }
+    );
+}
+
+is(
+    run_formatter(
+        payload( { workspace => { current_dir => $dir } } ),
+        kmcp_config(),
+        { PATH => stub_kmcp('v1.7.0->v1.7.1') }
+    ),
+    "~/project (kmcp v1.7.0->v1.7.1)\n",
+    'a command that prints text appears in the line'
+);
+
+is(
+    run_formatter(
+        payload( { workspace => { current_dir => $dir } } ),
+        kmcp_config(),
+        { PATH => stub_kmcp('') }
+    ),
+    "~/project\n",
+    'a command that prints nothing removes itself and its parens, leaving no stray separator'
+);
+
+is(
+    run_formatter(
+        payload( { workspace => { current_dir => $dir } } ),
+        kmcp_config(),
+        { PATH => '' }
+    ),
+    "~/project\n",
+    'with kmcp absent from PATH the line is unchanged'
 );
 
 # Config errors replace the line rather than breaking the TUI

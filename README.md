@@ -93,7 +93,9 @@ editors and `jsonc` tooling understand, so prefer it.
 Available sections: `dir`, `git`, `model`, `context`, `cache`, `cost`, `time`, plus any
 name defined under `commands`. `thinking` is a command, not a built-in: it reads `.thinking`
 out of the JSON the plugin sends, and prints nothing at the model default, which drops the
-field and its separator.
+field and its separator. `kmcp` is another command (see [below](#kmcp-when-knowledge-mcp-is-behind)):
+it prints one line when the installed knowledge-mcp is behind and nothing at all when it
+is current, so a current install draws the same line it always did.
 
 Color thresholds are a list; the entry with the highest `at` that the number has reached
 wins, and `at` compares the rounded, displayed value:
@@ -152,6 +154,44 @@ A group can dim its separators too, so the whole tail reads as one block:
 
 `muted_separator` affects only the text *between* the group's sections, not the sections
 themselves, and not a group's `before`/`after`.
+
+### kmcp: when knowledge-mcp is behind
+
+A stale MCP server announces itself: when the installed `knowledge-mcp` binary is behind
+the latest release, the line gains a tail:
+
+```
+~/git/project (main) 12% 120k/1M - 4m32s (kmcp v1.7.0->v1.7.1)
+```
+
+The segment is a command, not a built-in section — the formatter's `commands` primitive
+already runs a shell command per redraw, gets the session JSON on STDIN, and drops a
+section that prints nothing, separator included. The example config wires it up as a
+group with `before`/`after` parens:
+
+```jsonc
+{
+  "sections": ["dir", "git", { "sections": ["context", "time"], "separator": " - " },
+               { "sections": ["kmcp"], "before": "(", "after": ")" }],
+  "labels": { "kmcp": "kmcp " },
+  "commands": {
+    "kmcp": { "run": "knowledge-mcp debug --brief --check-updates", "timeout": 5 }
+  }
+}
+```
+
+`knowledge-mcp debug --brief --check-updates` prints exactly one line (`v1.7.0->v1.7.1`)
+when the installed binary is behind, and *nothing at all* when it is current — so the
+section and its parens drop out and the line is byte-identical to the one without the
+segment. That is deliberate: the segment is read-only, and the network call and its 24h
+cache belong to knowledge-mcp, so the statusline never blocks on GitHub and works
+offline. Missing from `PATH` is silent too, never an error in the bar.
+
+The flag ships with [renderorange/knowledge-mcp#45](https://github.com/renderorange/knowledge-mcp/issues/45);
+until then the command prints nothing and the line is unchanged, which is the safe
+direction. The 5s timeout gives the check (knowledge-mcp's own network timeout is 3s)
+room, and the formatter kills the process group on timeout, so a wedged binary cannot
+hold the bar.
 
 ### Every setting
 
